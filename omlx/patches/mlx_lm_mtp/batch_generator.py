@@ -3193,6 +3193,11 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
+    # The preceding fold already drafted the next chain. Discard those
+    # speculative head entries before appending this confirmed boundary row,
+    # just as the ordinary verify cycle does before its committed fold.
+    if not state.head_clone:
+        _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
     _chain_next_drafts(
         gen_batch,
         state,

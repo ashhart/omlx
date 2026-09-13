@@ -39,13 +39,16 @@ class Batch(SimpleNamespace):
         self.tokens = []
 
 
-def activate(cache, *, uid=0, metadata=None, primed=True):
+def activate(cache, *, uid=0, metadata=None, primed=True, depth=1, head_clone=False):
     mx.random.seed(11)
     model = _make_tiny_model()
     # The tiny Qwen3.5 fixture exercises the same fold/cache contract; only
     # admission is labeled Qwen4 here, not the architecture or model weights.
     model.model_type = "qwen4_exp"
     model._omlx_mtp_commit_align = cache.block_size
+    # Pre-load tests can change the process-wide default; own this schedule.
+    model._omlx_mtp_depth = depth
+    model._omlx_mtp_head_clone = head_clone
     tokens = _tokens(cache.block_size - 1, seed=17)
     request = SimpleNamespace(prompt_token_ids=tokens.tolist(), **(metadata or {}))
     gp.register(model, uid, request, cache)
@@ -243,14 +246,16 @@ def parity_device(request):
         mx.set_default_device(previous)
 
 
+@pytest.mark.parametrize("depth", (1, 3))
+@pytest.mark.parametrize("head_clone", (False, True))
 def test_repeated_verify_cycles_preserve_tokens_and_boundary_history(
-    parity_device, monkeypatch
+    parity_device, depth, head_clone, monkeypatch
 ):
     outputs = []
     emit_response = bg._emit_response
     for enabled in (False, True):
         cache = _MemoryMtpPrefixCache()
-        batch, _ = activate(cache)
+        batch, _ = activate(cache, depth=depth, head_clone=head_clone)
         batch.max_tokens = [25]
         state = batch._omlx_mtp_state
         # Fix the schedule so the comparison isolates cache publication.
