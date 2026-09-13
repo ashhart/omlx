@@ -233,8 +233,21 @@ def test_unsupported_model_and_bounded_pending_plans(monkeypatch):
     assert list(getattr(model, gp._PLANS)) == [11]
 
 
-def test_repeated_verify_cycles_preserve_tokens_and_boundary_history():
+@pytest.fixture(params=("cpu", "gpu"))
+def parity_device(request):
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu if request.param == "cpu" else mx.gpu)
+    try:
+        yield request.param
+    finally:
+        mx.set_default_device(previous)
+
+
+def test_repeated_verify_cycles_preserve_tokens_and_boundary_history(
+    parity_device, monkeypatch
+):
     outputs = []
+    emit_response = bg._emit_response
     for enabled in (False, True):
         cache = _MemoryMtpPrefixCache()
         batch, _ = activate(cache)
@@ -244,6 +257,39 @@ def test_repeated_verify_cycles_preserve_tokens_and_boundary_history():
         state.controller = None
         if not enabled:
             setattr(state, gp._STATE_PLAN, None)
+
+        def checked_emit(
+            gen_batch,
+            token_id,
+            logprobs,
+            stats=None,
+            *,
+            capture=enabled,
+            prefix_cache=cache,
+            mtp_state=state,
+        ):
+            boundary = len(gen_batch.tokens[0]) + 1
+            ledger = gen_batch.tokens[0] + [token_id]
+            expected = None
+            if capture and boundary % prefix_cache.block_size == 0:
+                expected = [
+                    [row[..., : boundary - 1, :] + 0 for row in entry.state]
+                    for entry in mtp_state.mtp_cache
+                ]
+                mx.eval(expected)
+            response = emit_response(gen_batch, token_id, logprobs, stats)
+            if expected is not None:
+                snapshot = prefix_cache.restore_mtp_prefix_snapshot(ledger, boundary)
+                assert snapshot is not None
+                for expected_entry, actual_entry in zip(expected, snapshot.mtp_cache):
+                    assert actual_entry.offset == boundary - 1
+                    for original, copied in zip(expected_entry, actual_entry.state):
+                        assert mx.array_equal(
+                            original, copied[..., : boundary - 1, :]
+                        ).item()
+            return response
+
+        monkeypatch.setattr(bg, "_emit_response", checked_emit)
         emitted = []
         while batch.uids:
             response = bg._mtp_next(batch, state)[0]
@@ -253,6 +299,12 @@ def test_repeated_verify_cycles_preserve_tokens_and_boundary_history():
             assert not cache.snapshots
             continue
         assert {boundary for _, boundary in cache.snapshots} == {8, 16, 24, 32}
+        # Full-prompt and incremental folds use different GPU reduction
+        # shapes, so the independent numerical oracle follows strict_model's
+        # CPU policy. Both devices above still require bit-exact live-cache
+        # snapshots and identical generated tokens with capture on and off.
+        if parity_device != "cpu":
+            continue
         for (ledger, boundary), snapshot in cache.snapshots.items():
             reference = _reference_head_cache(
                 batch.model, mx.array(ledger, dtype=mx.uint32)
