@@ -304,12 +304,8 @@ def test_repeated_verify_cycles_preserve_tokens_and_boundary_history(
             assert not cache.snapshots
             continue
         assert {boundary for _, boundary in cache.snapshots} == {8, 16, 24, 32}
-        # Full-prompt and incremental folds use different GPU reduction
-        # shapes, so the independent numerical oracle follows strict_model's
-        # CPU policy. Both devices above still require bit-exact live-cache
-        # snapshots and identical generated tokens with capture on and off.
-        if parity_device != "cpu":
-            continue
+        # Verify the history against an independent full-prompt fold on
+        # both devices, in addition to the exact live-cache checks above.
         for (ledger, boundary), snapshot in cache.snapshots.items():
             reference = _reference_head_cache(
                 batch.model, mx.array(ledger, dtype=mx.uint32)
