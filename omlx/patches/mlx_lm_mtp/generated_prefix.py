@@ -35,7 +35,7 @@ def register(model, uid, request, prefix_cache):
     host = priming._eligible_host(model)
     if (
         host is None
-        or getattr(host, "model_type", None) != "qwen4_exp"
+        or getattr(host, "model_type", None) not in ("qwen4_exp", "qwen4_exp_text")
         or not priming.priming_enabled()
         or prefix_cache is None
         or any(

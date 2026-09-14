@@ -39,12 +39,21 @@ class Batch(SimpleNamespace):
         self.tokens = []
 
 
-def activate(cache, *, uid=0, metadata=None, primed=True, depth=1, head_clone=False):
+def activate(
+    cache,
+    *,
+    uid=0,
+    metadata=None,
+    primed=True,
+    depth=1,
+    head_clone=False,
+    model_type="qwen4_exp",
+):
     mx.random.seed(11)
     model = _make_tiny_model()
     # The tiny Qwen3.5 fixture exercises the same fold/cache contract; only
     # admission is labeled Qwen4 here, not the architecture or model weights.
-    model.model_type = "qwen4_exp"
+    model.model_type = model_type
     model._omlx_mtp_commit_align = cache.block_size
     # Pre-load tests can change the process-wide default; own this schedule.
     model._omlx_mtp_depth = depth
@@ -90,10 +99,37 @@ def native_cache():
     return cache, blocks
 
 
+@pytest.mark.parametrize("wrapper", [None, "language_model", "_language_model"])
+def test_native_qwen4_text_host_registers_and_cleans_up(wrapper):
+    from tests.test_mlx_vlm_qwen4_exp_compat import (
+        _make_bound_qwen4_language_model,
+        _tiny_config,
+    )
+
+    # Use the language host's real constructor and owner binding, so a
+    # mislabeled stand-in cannot hide changes in loader model types.
+    host, owner = _make_bound_qwen4_language_model(_tiny_config())
+    assert host.model_type == "qwen4_exp_text"
+    assert host.get_mtp_module() is owner.mtp
+    model = host if wrapper is None else SimpleNamespace(**{wrapper: host})
+    cache = _MemoryMtpPrefixCache()
+    request = SimpleNamespace(prompt_token_ids=[2, 3, 4])
+
+    gp.register(model, 7, request, cache)
+
+    plan = getattr(host, gp._PLANS, {}).get(7)
+    assert plan is not None
+    assert plan.tokens == (2, 3, 4)
+    assert plan.cache() is cache
+    gp.unregister(model, 7)
+    assert not getattr(host, gp._PLANS)
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text"])
 @pytest.mark.parametrize("terminal", [False, True])
-def test_real_fold_restores_generated_boundary_and_detaches(terminal):
+def test_real_fold_restores_generated_boundary_and_detaches(terminal, model_type):
     cache, blocks = native_cache()
-    batch, token = activate(cache)
+    batch, token = activate(cache, model_type=model_type)
     ledger = batch.tokens[0] + [token]
     state = batch._omlx_mtp_state
     if terminal:
@@ -148,9 +184,10 @@ def test_real_fold_restores_generated_boundary_and_detaches(terminal):
         {"vlm_extra_key_ranges_for_cache": []},
     ],
 )
-def test_media_requests_never_publish(metadata):
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text"])
+def test_media_requests_never_publish(metadata, model_type):
     cache = _MemoryMtpPrefixCache()
-    batch, token = activate(cache, metadata=metadata)
+    batch, token = activate(cache, metadata=metadata, model_type=model_type)
     bg._emit_response(batch, token, mx.zeros((256,)))
     assert not cache.snapshots
 
