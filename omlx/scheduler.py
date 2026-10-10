@@ -9171,7 +9171,11 @@ class Scheduler:
                 request_id=request.request_id,
                 prompt_tokens=request.prompt_token_ids,
                 cached_tokens=request.cached_tokens,
-                prefix_cache=self.block_aware_cache,
+                prefix_cache=(
+                    self._remote_prefill.prefix_cache_for(request, self.block_aware_cache)
+                    if self._remote_prefill is not None
+                    else self.block_aware_cache
+                ),
                 extra_keys=request.vlm_extra_keys_for_cache,
                 extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,

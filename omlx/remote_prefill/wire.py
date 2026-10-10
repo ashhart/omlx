@@ -30,6 +30,12 @@ DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
 DIM_LABELS = frozenset(
     {"block", "token", "head", "head_dim", "kv", "kv_head_dim", "latent"}
 )
+# Hybrid models export whole-prefix state as named entries, each with its own kind:
+# "qsa" (sparse-attention keys, values and raw index keys), "gdn" (Gated DeltaNet conv
+# and recurrent state) and "ple" (the PLE layer's short-conv state). Their first
+# dimension is "block": the axis frames are cut along (tokens, conv taps or heads).
+HYBRID_KINDS = frozenset({"qsa", "gdn", "ple", "mtp"})
+HYBRID_DIM_LABELS = frozenset({"head", "head_dim", "index_dim", "channel", "v_dim", "k_dim", "hidden"})
 
 
 class WireError(ValueError):
@@ -123,6 +129,9 @@ class LayerExport:
     head_size: int = 0
     latent_size: int = 0
     rope_size: int = 0
+    # Hybrid entries: the model layer they belong to and which of its tensors they hold.
+    layer: int = -1
+    name: str = ""
 
     @property
     def row_bytes(self) -> int:
@@ -154,7 +163,11 @@ class LayerExport:
             head_size=_int(raw.get("head_size", 0), "head size"),
             latent_size=_int(raw.get("latent_size", 0), "latent size"),
             rope_size=_int(raw.get("rope_size", 0), "rope size"),
+            layer=_int(raw.get("layer", 0), "model layer") if "layer" in raw else -1,
+            name=str(raw.get("name", "")),
         )
+        if layer.kind in HYBRID_KINDS:
+            return _check_hybrid(layer)
         if layer.kind not in {"attention", "mla"}:
             raise WireError(f"layer {layer.index} has unknown kind {layer.kind!r}")
         if layer.dtype not in DTYPE_BYTES:
@@ -174,6 +187,21 @@ class LayerExport:
                 f"layer {layer.index} needs its heads, total heads and head size"
             )
         return layer
+
+
+def _check_hybrid(entry: LayerExport) -> LayerExport:
+    """A hybrid entry needs its model layer, a name, and its row axis first."""
+    if entry.layer < 0 or not entry.name:
+        raise WireError(f"entry {entry.index} needs its model layer and name")
+    if entry.dtype not in DTYPE_BYTES:
+        raise WireError(f"entry {entry.index} has unsupported dtype {entry.dtype!r}")
+    if (
+        entry.dims[0] != "block"
+        or not set(entry.dims[1:]) <= HYBRID_DIM_LABELS
+        or len(set(entry.dims)) != len(entry.dims)
+    ):
+        raise WireError(f"entry {entry.index} has unknown or repeated dims")
+    return entry
 
 
 @dataclass(frozen=True)
@@ -220,4 +248,14 @@ class Manifest:
             raise WireError("manifest tp_rank is outside tp_size")
         if len({layer.index for layer in manifest.layers}) != len(manifest.layers):
             raise WireError("manifest repeats a layer")
+        kinds = {layer.kind in HYBRID_KINDS for layer in manifest.layers}
+        if len(kinds) != 1:
+            raise WireError("manifest mixes hybrid entries with attention pages")
+        if manifest.hybrid and manifest.first_token != 0:
+            raise WireError("a hybrid manifest must export the whole prefix")
         return manifest
+
+    @property
+    def hybrid(self) -> bool:
+        """Whether this handoff carries a hybrid model's whole-prefix state."""
+        return self.layers[0].kind in HYBRID_KINDS

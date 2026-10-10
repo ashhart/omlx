@@ -21,7 +21,8 @@ first token comes from its own model.
   `OMLX_MCDMA_RPC_LIBRARY`.
 - A model whose layers use standard attention caches (mlx-lm `KVCache` or
   `QuantizedKVCache`). DeepSeek-style MLA works when vLLM keeps its latent cache
-  in bf16 or fp16.
+  in bf16 or fp16. Qwen3.8 Flash Next, a hybrid of Gated DeltaNet and QSA
+  layers, works too; see [Hybrid models](#hybrid-models).
 
 ## How a request is served
 
@@ -97,6 +98,40 @@ on and off.
   `head_dim`, or `kv_lora_rank` and `qk_rope_head_dim` for MLA), the same for
   every layer. Models whose config lacks it always prefill locally.
 - Multimodal and SpecPrefill prompts, and models with sliding-window, recurrent
-  or hybrid caches, always prefill locally.
+  or hybrid caches other than Qwen3.8 Flash Next's, always prefill locally.
 - vLLM's fp8 KV caches are not accepted.
 - The CRC-32 costs roughly one pass over the data on each side.
+
+## Hybrid models
+
+Qwen3.8 Flash Next (`qwen4_exp`) has 36 Gated DeltaNet layers, whose recurrent
+state exists only for a whole prefix, 12 QSA sparse-attention layers and one PLE
+layer. Its handoff therefore always covers the prompt from token 0 and replaces
+whatever the local prefix cache restored, instead of appending to it:
+
+- vLLM is asked with `export_from` 0, and the manifest lists named entries per
+  layer: QSA keys, values and raw index keys, Gated DeltaNet conv and float32
+  recurrent state, and the PLE conv state. MCDMA's `docs/kv-handoff.md` gives
+  their fixed layout.
+- Before any frame moves, the manifest must hold exactly the entries the local
+  model's config implies, with matching shapes and a float32 recurrent state.
+- The entries become fresh caches: QSA caches get their keys, values, raw index
+  keys and positions `0 .. T-1`, linear-attention caches their conv and
+  recurrent state, and the PLE layer its conv state and the prompt's last
+  tokens as n-gram context.
+- Single-rank producers only. Run vLLM as the kv-handoff doc describes
+  (`--max-num-seqs 1`, no prefix caching, bf16 KV).
+
+With Lightning MTP on (`mtp_enabled`), the MTP head needs the prompt in its own
+cache. Prompt priming normally builds it from the hidden states of a local
+prefill. A vLLM producer started with `--speculative-config
+'{"method":"mtp","num_speculative_tokens":1}'` caches the same history in its
+drafter. The handoff then adds `mtp` entries:
+- the head layer's keys, values and raw index keys for pairs `0 .. T-2`;
+- the trunk hidden streams of token `T-1`.
+
+oMLX resumes priming from them at the handoff's boundary, the way it resumes
+from a prefix-cache sidecar. Without them, the head sees only the generation
+prompt. That costs little on prose but much on answers that copy from the
+prompt: in a code-rewrite test, unprimed drafting reached 88 tok/s against
+120 primed.

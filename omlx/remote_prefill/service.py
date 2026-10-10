@@ -12,6 +12,7 @@ from typing import Any
 from ..cluster.rdma.mailbox import ClientMailbox
 from ..cluster.rdma.words import load_word_ops
 from .client import request_prefill
+from . import hybrid
 from .geometry import KVGeometry, check_manifest, model_geometry
 from .inject import SUPPORTED_CACHES, extend_caches, layer_updates
 from .job import PrefillJob
@@ -40,6 +41,27 @@ def _activation_dtype(mx: Any, model: Any) -> Any:
     return mx.bfloat16
 
 
+class _HandedOffMtp:
+    """A prefix cache whose MTP sidecar lookup returns one handoff's MTP-head history.
+
+    Prompt priming restores a sidecar at the backbone's cache boundary. A hybrid handoff sets that
+    boundary itself, so the handoff's history stands in for the sidecar; everything else, including
+    publishing new sidecars, goes to the real prefix cache."""
+
+    def __init__(self, base: Any, snapshot: Any) -> None:
+        self._base = base
+        self._snapshot = snapshot
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def restore_mtp_prefix_snapshot(self, tokens: list[int], boundary_tokens: int, **kwargs: Any) -> Any:
+        if int(boundary_tokens) == self._snapshot.boundary_tokens:
+            return self._snapshot
+        restore = getattr(self._base, "restore_mtp_prefix_snapshot", None)
+        return restore(tokens, boundary_tokens, **kwargs) if callable(restore) else None
+
+
 class RemotePrefill:
     """Decides which requests prefill on the vLLM server and hands their KV caches to the scheduler."""
 
@@ -63,6 +85,8 @@ class RemotePrefill:
         self._jobs: dict[str, PrefillJob] = {}
         # Requests whose remote prefill already ran; each request gets one at most.
         self._served: set[str] = set()
+        # MTP-head history from hybrid handoffs, until prompt priming takes it (prefix_cache_for).
+        self._mtp: dict[str, Any] = {}
         # One handoff uses the links at a time, whichever request it belongs to.
         self._links = threading.Lock()
         self._failures = 0
@@ -70,6 +94,7 @@ class RemotePrefill:
         self._paused_until = 0.0
         self._cache_reason: str | None = None
         self._geometry: KVGeometry | None = None
+        self._hybrid: hybrid.HybridGeometry | None = None
         self.last: dict[str, Any] = {}
         self.last_error = ""
 
@@ -112,6 +137,11 @@ class RemotePrefill:
                 {type(cache).__name__ for cache in caches} - SUPPORTED_CACHES
             )
             if unsupported:
+                # A hybrid model takes whole-prefix state instead of appended pages.
+                self._hybrid, reason = hybrid.hybrid_geometry(self._scheduler.model, caches)
+                if self._hybrid is not None:
+                    self._cache_reason = ""
+                    return self._cache_reason
                 self._cache_reason = f"cache types {unsupported} cannot take a handoff"
             else:
                 self._geometry, self._cache_reason = model_geometry(
@@ -121,7 +151,9 @@ class RemotePrefill:
 
     def _check_model(self, manifest: Any) -> None:
         """Refuse a handoff whose layers do not fit the local model's caches."""
-        if self._geometry is not None:
+        if self._hybrid is not None:
+            hybrid.check_manifest(manifest, self._hybrid)
+        elif self._geometry is not None:
             check_manifest(manifest, self._geometry)
 
     @staticmethod
@@ -165,7 +197,8 @@ class RemotePrefill:
         end = self._end(request)
         if self._ineligible(request, end):
             return False
-        start = self._local_prefix(request, end)
+        # A hybrid's recurrent state exists only for whole prefixes, so it always exports from 0.
+        start = 0 if self._hybrid is not None else self._local_prefix(request, end)
         if end - start < self.settings.min_tokens:
             return False
         job = PrefillJob(
@@ -217,6 +250,9 @@ class RemotePrefill:
         cached = request.cached_tokens or 0
         first = job.result.manifests[0].first_token
         if cached >= job.end:
+            return
+        if self._hybrid is not None:
+            self._inject_hybrid(request, job, cached)
             return
         if cached < first:
             logger.info(
@@ -274,6 +310,87 @@ class RemotePrefill:
             self.last["gbit_s"],
         )
 
+    def _inject_hybrid(self, request: Any, job: PrefillJob, cached: int) -> None:
+        """Replace `request`'s caches with the handoff's whole-prefix state."""
+        mx = self._mx
+        from mlx_lm.models.cache import make_prompt_cache
+
+        try:
+            caches = hybrid.build_caches(
+                mx,
+                lambda: make_prompt_cache(self._scheduler.model),
+                self._hybrid,
+                job.result,
+                job.tokens,
+                _activation_dtype(mx, self._scheduler.model),
+            )
+        except Exception as exc:
+            expected = isinstance(exc, (HandoffError, ValueError))
+            logger.warning(
+                "Request %s: the hybrid handoff could not be applied; prefilling here: %r",
+                request.request_id,
+                exc,
+                exc_info=not expected,
+            )
+            self._failed(f"the handoff could not be applied: {type(exc).__name__}: {exc}")
+            return
+        # Whatever the local prefix cache restored covers fewer tokens; the handoff replaces it.
+        if cached:
+            self._reset(request)
+        request.prompt_cache = caches
+        request.cached_tokens = job.end
+        request.remaining_tokens = request.prompt_token_ids[job.end :]
+        self._keep_mtp(request, job)
+        self._succeeded(job, 0)
+
+    def _keep_mtp(self, request: Any, job: PrefillJob) -> None:
+        """Hold the handoff's MTP-head history for prompt priming; without it the head primes locally."""
+        mx = self._mx
+        try:
+            built = hybrid.build_mtp(
+                mx,
+                self._scheduler.model,
+                self._hybrid,
+                job.result,
+                job.end,
+                _activation_dtype(mx, self._scheduler.model),
+            )
+        except Exception as exc:
+            logger.warning("Request %s: the MTP history could not be applied: %r", request.request_id, exc)
+            return
+        if built is None:
+            return
+        from ..patches.mlx_lm_mtp.prompt_priming import _MtpPrefixSnapshot
+
+        caches, hidden = built
+        self._mtp[request.request_id] = _MtpPrefixSnapshot(job.end, caches, hidden)
+
+    def prefix_cache_for(self, request: Any, prefix_cache: Any) -> Any:
+        """`prefix_cache`, or a view of it that restores this request's handed-off MTP history."""
+        snapshot = self._mtp.pop(request.request_id, None)
+        return prefix_cache if snapshot is None else _HandedOffMtp(prefix_cache, snapshot)
+
+    def _succeeded(self, job: PrefillJob, cached: int) -> None:
+        self._failures = 0
+        self._pauses = 0
+        result = job.result
+        seconds = max(result.transfer_s, 1e-9)
+        self.last = {
+            "tokens": job.end - cached,
+            "prefill_s": round(result.prefill_s, 3),
+            "transfer_s": round(result.transfer_s, 3),
+            "bytes": result.nbytes,
+            "gbit_s": round(8 * result.nbytes / seconds / 1e9, 2),
+        }
+        logger.info(
+            "Remote prefill of %d tokens, prefill %.2f s, transfer %.2f s (%.1f Gbit/s, %.0f MB)",
+            self.last["tokens"],
+            result.prefill_s,
+            result.transfer_s,
+            self.last["gbit_s"],
+            result.nbytes / 1e6,
+        )
+
     def _reset(self, request: Any) -> None:
         manager = getattr(self._scheduler, "paged_cache_manager", None)
         if manager is not None:
@@ -287,6 +404,7 @@ class RemotePrefill:
     def forget(self, request_id: str) -> None:
         """Stop and drop the remote prefill of a request that left the queue."""
         self._served.discard(request_id)
+        self._mtp.pop(request_id, None)
         job = self._jobs.pop(request_id, None)
         if job is not None:
             job.cancel()
@@ -297,6 +415,7 @@ class RemotePrefill:
             job.cancel()
         self._jobs.clear()
         self._served.clear()
+        self._mtp.clear()
 
     def status(self) -> dict[str, Any]:
         return {
